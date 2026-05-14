@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import spidev
 import time
+import json
 import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
 import logging
 from logging.handlers import RotatingFileHandler
+from datetime import datetime
 
 # === Configuration ===
 SPI_BUS        = 0
@@ -117,7 +119,11 @@ def pump_cycle():
 
 # === MQTT publish ===
 def send_moisture(value):
-    client.publish(TOPIC_MOISTURE, value, retain=True)
+    payload = {
+        "moisture": value,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    client.publish(TOPIC_MOISTURE, json.dumps(payload), retain=True)
 
 # === Main ===
 def main():
