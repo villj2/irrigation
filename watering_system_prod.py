@@ -39,22 +39,34 @@ logger = logging.getLogger()
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+# === Topics ===
+TOPIC_MOISTURE    = "watering/soil/moisture"
+TOPIC_PUMP        = "watering/soil/pump"
+TOPIC_PUMP_MANUAL = "watering/soil/pumpmanual"
+
 # === MQTT ===
 BROKER = "homeassistant.local"
 PORT = 1883
 USERNAME = "<username>"
 PASSWORD = "<password>"
-TOPIC = "watering/soil/moisture"
 
 connected = False
 
 def on_connect(client, userdata, flags, rc):
     global connected
     connected = True
+    client.subscribe(TOPIC_PUMP_MANUAL)
+
+def on_message(client, userdata, msg):
+    if msg.topic == TOPIC_PUMP_MANUAL:
+        payload = msg.payload.decode("utf-8", errors="replace")
+        print(f"Manual pump command received: {payload}")
+        logger.info(f"Manual pump command received: {payload}")
 
 client = mqtt.Client()
 client.username_pw_set(USERNAME, PASSWORD)
 client.on_connect = on_connect
+client.on_message = on_message
 client.connect(BROKER, PORT, 60)
 client.loop_start()
 
@@ -78,10 +90,19 @@ def read_adc(spi, channel):
 def raw_to_voltage(raw):
     return (raw / 1023.0) * VREF
 
+# === Sensor ===
+def read_moisture(spi):
+    raw = read_adc(spi, SENSOR_CHANNEL)
+    wetness = (RAW_DRY - raw) / (RAW_DRY - RAW_WET)
+    wetness = max(0.0, min(1.0, wetness))
+    wetness_percent = round(wetness * 100, 1)
+    return wetness, wetness_percent
+
 # === Pump ===
 def start_pump():
     print("Pump ON")
     logger.info("Pump ON")
+    client.publish(TOPIC_PUMP, "1")
     GPIO.output(PIN, GPIO.HIGH)
     time.sleep(1)
     GPIO.output(PIN, GPIO.LOW)
@@ -95,7 +116,7 @@ def pump_cycle():
 
 # === MQTT publish ===
 def send_moisture(value):
-    client.publish(TOPIC, value, retain=True)
+    client.publish(TOPIC_MOISTURE, value, retain=True)
 
 # === Main ===
 def main():
@@ -115,19 +136,11 @@ def main():
     # =========================
     # INITIAL MEASUREMENT
     # =========================
-    raw = read_adc(spi, SENSOR_CHANNEL)
-    voltage = raw_to_voltage(raw)
-
-    wetness = (RAW_DRY - raw) / (RAW_DRY - RAW_WET)
-    wetness = max(0.0, min(1.0, wetness))
-    wetness_percent = round(wetness * 100, 1)
-
-    last_wetness = wetness
+    last_wetness, wetness_percent = read_moisture(spi)
     last_sensor_time = time.time()
 
     print(f"[START] Moisture: {wetness_percent:.1f}%")
     logger.info(f"[START] Moisture: {wetness_percent}%")
-
     send_moisture(wetness_percent)
 
     try:
@@ -138,19 +151,11 @@ def main():
             # SENSOR (5 min)
             # =========================
             if now_ts - last_sensor_time >= SENSOR_INTERVAL:
-                raw = read_adc(spi, SENSOR_CHANNEL)
-                voltage = raw_to_voltage(raw)
-
-                wetness = (RAW_DRY - raw) / (RAW_DRY - RAW_WET)
-                wetness = max(0.0, min(1.0, wetness))
-                wetness_percent = round(wetness * 100, 1)
-
-                last_wetness = wetness
+                last_wetness, wetness_percent = read_moisture(spi)
                 last_sensor_time = now_ts
 
                 print(f"Moisture: {wetness_percent:.1f}%")
                 logger.info(f"Moisture: {wetness_percent}%")
-
                 send_moisture(wetness_percent)
 
             # =========================
