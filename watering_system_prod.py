@@ -1,103 +1,174 @@
 #!/usr/bin/env python3
 import spidev
 import time
+import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
-from datetime import datetime
-import time
 import logging
 from logging.handlers import RotatingFileHandler
 
 # === Configuration ===
-SPI_BUS        = 0          # SPI bus (0 or 1 on Pi)
-SPI_DEVICE     = 0          # SPI device (0 for CE0, 1 for CE1)
-SPI_MAX_SPEED  = 1_350_000  # 1.35 MHz (safe for MCP3008)
-VREF           = 3.3        # Reference voltage for ADC (use 3.3V rail)
-SENSOR_CHANNEL = 0          # MCP3008 CH0
+SPI_BUS        = 0
+SPI_DEVICE     = 0
+SPI_MAX_SPEED  = 1_350_000
+VREF           = 3.3
+SENSOR_CHANNEL = 0
 
-RAW_DRY        = 920        # Manually measured in air
-RAW_WET        = 90         # Manually measured in water
-PIN            = 26         # Broadcom-Nummer des Pins
+RAW_DRY        = 920
+RAW_WET        = 90
 
+PIN            = 26
+
+SENSOR_INTERVAL   = 15 * 60
+WATERING_INTERVAL = 3 * 3600
+MOISTURE_THRESHOLD = 0.45
+
+# === GPIO ===
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(PIN, GPIO.OUT)
 
-# === Logger Initialization ===
-
-# Log-Handler einrichten: Maximal 10 MB pro Datei, dann wird die alte Datei archiviert
-handler = RotatingFileHandler("/home/vill/Desktop/watering_system_prod.log", maxBytes=10*1024*1024, backupCount=5)
-handler.setLevel(logging.INFO)
-
+# === Logger ===
+handler = RotatingFileHandler(
+    "/home/vill/Desktop/watering_system_prod.log",
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5
+)
 formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
 handler.setFormatter(formatter)
 
-# Logger konfigurieren
 logger = logging.getLogger()
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+# === MQTT ===
+BROKER = "homeassistant.local"
+PORT = 1883
+USERNAME = "<username>"
+PASSWORD = "<password>"
+TOPIC = "watering/soil/moisture"
 
-# === SPI Initialization ===
-def init_spi(bus=SPI_BUS, device=SPI_DEVICE, speed=SPI_MAX_SPEED):
-    """Return an spidev object configured for the MCP3008."""
+connected = False
+
+def on_connect(client, userdata, flags, rc):
+    global connected
+    connected = True
+
+client = mqtt.Client()
+client.username_pw_set(USERNAME, PASSWORD)
+client.on_connect = on_connect
+client.connect(BROKER, PORT, 60)
+client.loop_start()
+
+def wait_for_mqtt(timeout=5):
+    start = time.time()
+    while not connected and time.time() - start < timeout:
+        time.sleep(0.1)
+
+# === SPI ===
+def init_spi():
     spi = spidev.SpiDev()
-    spi.open(bus, device)
-    spi.max_speed_hz = speed
+    spi.open(SPI_BUS, SPI_DEVICE)
+    spi.max_speed_hz = SPI_MAX_SPEED
     return spi
 
-# === ADC Read ===
 def read_adc(spi, channel):
-    """
-    Perform a single read from the MCP3008.
-    Returns an integer 0–1023 corresponding to the analog voltage.
-    """
-    if not 0 <= channel <= 7:
-        raise ValueError("ADC channel must be between 0 and 7")
-    # MCP3008 protocol: [start=1][SGL/DIFF + channel (bits 6–4)][don't care]
     cmd = [1, (8 + channel) << 4, 0]
     resp = spi.xfer2(cmd)
-    # Assemble 10-bit result from the last two bytes
-    raw = ((resp[1] & 0x03) << 8) | resp[2]
-    return raw
+    return ((resp[1] & 0x03) << 8) | resp[2]
 
-def raw_to_voltage(raw, vref=VREF):
-    """Convert raw ADC reading to voltage."""
-    return (raw / 1023.0) * vref
+def raw_to_voltage(raw):
+    return (raw / 1023.0) * VREF
 
-# === Main Loop ===
+# === Pump ===
+def start_pump():
+    print("Pump ON")
+    logger.info("Pump ON")
+    GPIO.output(PIN, GPIO.HIGH)
+    time.sleep(1)
+    GPIO.output(PIN, GPIO.LOW)
+
+def pump_cycle():
+    start_pump()
+    time.sleep(310)
+    start_pump()
+    time.sleep(310)
+    start_pump()
+
+# === MQTT publish ===
+def send_moisture(value):
+    client.publish(TOPIC, value, retain=True)
+
+# === Main ===
 def main():
     spi = init_spi()
+
+    last_sensor_time = 0
+    last_watering_time = 0
+    last_wetness = 0.0
+
+    print("System started - sensor every 5 min, pump every 3h")
+
+    # =========================
+    # MQTT READY CHECK
+    # =========================
+    wait_for_mqtt()
+
+    # =========================
+    # INITIAL MEASUREMENT
+    # =========================
+    raw = read_adc(spi, SENSOR_CHANNEL)
+    voltage = raw_to_voltage(raw)
+
+    wetness = (RAW_DRY - raw) / (RAW_DRY - RAW_WET)
+    wetness = max(0.0, min(1.0, wetness))
+    wetness_percent = round(wetness * 100, 1)
+
+    last_wetness = wetness
+    last_sensor_time = time.time()
+
+    print(f"[START] Moisture: {wetness_percent:.1f}%")
+    logger.info(f"[START] Moisture: {wetness_percent}%")
+
+    send_moisture(wetness_percent)
+
     try:
-        print(f"Reading moisture on CH{SENSOR_CHANNEL} (CTRL+C to quit)")
         while True:
-            
-            raw = read_adc(spi, SENSOR_CHANNEL)
-            voltage = raw_to_voltage(raw)
-            # Normalize to 0.0–1.0 wetness ratio
-            # wetness = (VREF - voltage) / VREF
-            wetness = (RAW_DRY - raw) / (RAW_DRY - RAW_WET)
-            wetness = max(0.0, min(1.0, wetness))
-            
-            print(f"Raw: {raw:4d} | Voltage: {voltage:.2f} V | Wetness: {wetness:.0%}")
-            logger.info(f"Raw: {raw:4d} | Voltage: {voltage:.2f} V | Wetness: {wetness:.0%}")
-            
-            # Don't do anything between 21:00 and 07:00
-            now = datetime.now().time()
-            if now >= datetime.strptime("21:00", "%H:%M").time() or now <= datetime.strptime("07:00", "%H:%M").time():
-                time.sleep(1800.0)
-                continue
-            
-            if(wetness < 0.6):
-                print(f"Start pump now")
-                logger.info(f"Start pump now")
-                GPIO.output(PIN, GPIO.HIGH)  # START: HIGH
-                time.sleep(1)
-                GPIO.output(PIN, GPIO.LOW)   # dann LOW
-            
-            time.sleep(1800.0)
+            now_ts = time.time()
+
+            # =========================
+            # SENSOR (5 min)
+            # =========================
+            if now_ts - last_sensor_time >= SENSOR_INTERVAL:
+                raw = read_adc(spi, SENSOR_CHANNEL)
+                voltage = raw_to_voltage(raw)
+
+                wetness = (RAW_DRY - raw) / (RAW_DRY - RAW_WET)
+                wetness = max(0.0, min(1.0, wetness))
+                wetness_percent = round(wetness * 100, 1)
+
+                last_wetness = wetness
+                last_sensor_time = now_ts
+
+                print(f"Moisture: {wetness_percent:.1f}%")
+                logger.info(f"Moisture: {wetness_percent}%")
+
+                send_moisture(wetness_percent)
+
+            # =========================
+            # PUMP (3h)
+            # =========================
+            if last_wetness < MOISTURE_THRESHOLD:
+                if (now_ts - last_watering_time) >= WATERING_INTERVAL:
+                    pump_cycle()
+                    last_watering_time = now_ts
+                    logger.info("Pumping done")
+
+            time.sleep(1)
+
     except KeyboardInterrupt:
-        print("\nInterrupted, closing SPI.")
+        print("Stopping...")
     finally:
         spi.close()
+        GPIO.cleanup()
 
 if __name__ == "__main__":
     main()
