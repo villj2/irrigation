@@ -37,6 +37,7 @@ handler.setFormatter(formatter)
 
 logger = logging.getLogger()
 logger.addHandler(handler)
+logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
 
 # === Topics ===
@@ -148,7 +149,7 @@ def main():
             now_ts = time.time()
 
             # =========================
-            # SENSOR (5 min)
+            # SENSOR (15 min)
             # =========================
             if now_ts - last_sensor_time >= SENSOR_INTERVAL:
                 last_wetness, wetness_percent = read_moisture(spi)
