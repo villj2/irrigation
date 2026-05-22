@@ -65,6 +65,7 @@ def on_message(client, userdata, msg):
         payload = msg.payload.decode("utf-8", errors="replace")
         print(f"Manual pump command received: {payload}")
         logger.info(f"Manual pump command received: {payload}")
+        start_pump()
 
 client = mqtt.Client()
 client.username_pw_set(USERNAME, PASSWORD)
